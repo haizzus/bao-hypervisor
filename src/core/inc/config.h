@@ -122,6 +122,9 @@ extern struct config {
     /* The number of VMs specified by this configuration */
     size_t vmlist_size;
 
+    /* The number of VirtIO devices specified by this configuration */
+    size_t virtiodevicelist_size;
+
     /* Array list with VM configuration */
     struct vm_config vmlist[];
 

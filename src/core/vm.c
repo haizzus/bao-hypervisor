@@ -8,6 +8,9 @@
 #include <mem.h>
 #include <cache.h>
 #include <config.h>
+#include <objpool.h>
+
+OBJPOOL_ALLOC(emul_cache, struct emul_mem, sizeof(struct emul_mem));
 
 static void vm_master_init(struct vm* vm, const struct vm_config* config, vmid_t vm_id)
 {
@@ -230,6 +233,70 @@ static struct vm* vm_allocation_init(struct vm_allocation* vm_alloc) {
     return vm;
 }
 
+/*
+static void virtio_ipc_init(struct vm* vm, const struct vm_config* vm_config)
+{
+    for (size_t j = 0; j < vm_config->platform.virtiodevices_num; j++) {
+        struct virtio_device *dev = &vm_config->platform.virtiodevices[j];
+        uint8_t shmem_id = config.virtio_device_list[dev->device_id].shmem_id;
+        struct shmem *shmem = ipc_get_shmem(shmem_id);
+        if(shmem == NULL) {
+            WARNING("Invalid shmem id in configuration. Ignored.");
+            continue;
+        }
+        size_t size = config.virtio_device_list[dev->device_id].shmem_size;
+        if(size > shmem->size) {
+            size = shmem->size;
+            WARNING("Trying to map region to smaller shared memory. Truncated");
+        }
+        
+        spin_lock(&shmem->lock);
+        shmem->cpu_masters |= (1ULL << cpu()->id);
+        spin_unlock(&shmem->lock);
+
+        struct vm_mem_region reg = {
+            .base = config.virtio_device_list[dev->device_id].shmem_base,
+            .size = size,
+            .place_phys = true,
+            .phys = shmem->phys,
+            .colors = shmem->colors
+        };
+
+        vm_map_mem_region(vm, &reg);
+    }
+}
+*/
+
+static void vm_init_virtio(struct vm* vm, const struct vm_config* vm_config)
+{
+    // only initialize if there is at least a virtio device
+    if (vm_config->platform.virtiodevices_num > 0)
+    {
+        // save the virtio devices in the vm
+        vm->virtiodevices_num = vm_config->platform.virtiodevices_num;
+        vm->virtiodevices = vm_config->platform.virtiodevices;
+        
+        // for all the virtio devices of the vm
+        for (int i = 0; i < vm_config->platform.virtiodevices_num; i++) 
+        {
+            struct virtio_device *virtio_dev = &vm_config->platform.virtiodevices[i];
+            if(!virtio_dev->is_back_end) 
+            {
+                objpool_init(&emul_cache); 
+                struct emul_mem *emu = objpool_alloc(&emul_cache);    // TODO: FREE THIS CACHE
+                emu->va_base = virtio_dev->va;
+                emu->size = ALIGN(sizeof(struct virtio_mmio_reg), PAGE_SIZE);
+                emu->handler = virtio_mmio_emul_handler;
+                
+                // create the emulated object for the virtio device
+                // the `virtio_mmio_emul_handler` is the function that will be called when the device is accessed
+                vm_emul_add_mem(vm, emu);
+            }
+        }
+        virtio_assign_backend_cpu(vm);
+    }
+}
+
 struct vm* vm_init(struct vm_allocation* vm_alloc, const struct vm_config* config,
     bool master, vmid_t vm_id)
 {
@@ -272,6 +339,7 @@ struct vm* vm_init(struct vm_allocation* vm_alloc, const struct vm_config* confi
         vm_init_mem_regions(vm, config);
         vm_init_dev(vm, config);
         vm_init_ipc(vm, config);
+        vm_init_virtio(vm, config);
     }
 
     cpu_sync_and_clear_msgs(&vm->sync);

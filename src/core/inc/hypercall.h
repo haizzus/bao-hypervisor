@@ -11,7 +11,8 @@
 
 enum {
     HC_INVAL = 0,
-    HC_IPC = 1
+    HC_IPC = 1,
+    HC_VIRTIO = 2
 };
 
 enum {
