@@ -60,7 +60,20 @@ CPU_MSG_HANDLER(virtio_handler, VIRTIO_CPUMSG_ID);
 
 void virtio_init()
 {
-    int backend_devices[config.virtiodevicelist_size];
+    uint32_t virtiodevicelist_size = 0;
+
+    // get the number of virtio devices
+    for (int vm_id = 0; vm_id < config.vmlist_size; vm_id++)
+    {
+        struct vm_config *vm_config = &config.vmlist[vm_id]; 
+        for (int i = 0; i < vm_config->platform.virtiodevices_num; i++) 
+        {
+            if (vm_config->platform.virtiodevices[i].is_back_end)
+                virtiodevicelist_size++;
+        }
+    }
+    
+    int backend_devices[virtiodevicelist_size];
 
     objpool_init(&virtio_device_cache);
     list_init(&virtio_device_list);
@@ -69,7 +82,7 @@ void virtio_init()
     list_init(&virtio_device_pooling_list);
 
     // create a list with all the virtio devices
-    for (int i = 0; i < config.virtiodevicelist_size; i++) 
+    for (int i = 0; i < virtiodevicelist_size; i++) 
     {
         struct virtio_device_params *node = objpool_alloc(&virtio_device_cache);
         node->id = i;
@@ -86,8 +99,13 @@ void virtio_init()
             struct virtio_device *dev = &vm_config->platform.virtiodevices[i];
             if(dev->is_back_end)
             {
-                if (backend_devices[dev->device_id] != -1) {
-                    ERROR("Failed to link backend to the device, more than one back-end was atributed to the devicen %d", dev->device_id);
+                if (backend_devices[dev->device_id] != -1) 
+                {
+                    for (int i = 0; i < virtiodevicelist_size; i++) 
+                    {
+                        objpool_free(&virtio_device_cache, (struct virtio_device_params*)list_pop(&virtio_device_list));
+                    }
+                    ERROR("Failed to link backend to the device, more than one back-end was atributed to the VirtIO device %d", dev->device_id);
                 }
                 else {
                     dev->backend_id = vm_id;
@@ -100,9 +118,17 @@ void virtio_init()
     }
 
     // check if there is only one backend for each virtio device
-    for (int i = 0; i < config.virtiodevicelist_size; i++)
+    for (int i = 0; i < virtiodevicelist_size; i++)
+    {
         if(backend_devices[i] == -1)
+        {
+            for (int i = 0; i < virtiodevicelist_size; i++) 
+            {
+                objpool_free(&virtio_device_cache, (struct virtio_device_params*)list_pop(&virtio_device_list));
+            }
             ERROR("There is no backend for the VirtIO device %d", i);
+        } 
+    }
 }
 
 void virtio_assign_backend_cpu(struct vm* vm)
@@ -250,6 +276,7 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
                     break;
                 }
                 dev_id = node->device_id;
+                objpool_free(&virtio_device_pooling_cache, node);
             }
         // ask operation (device id, access address, operation, value to write and access width)
         case VIRTIO_ASK_OP:

@@ -36,7 +36,7 @@ struct virtio_device {
     int frontend_id;                // Contains the ID of the VM where the frontend driver is located (Generated automatically by virtio_init function)
     int backend_id;                 // Contains the ID of the VM where the backend driver is located (Generated automatically by virtio_init function)
     bool is_back_end;               // Specifies if the VM will contain the VirtIO backend driver
-    bool pooling;                   // Delineate if the backend execution mode is going to be polling or by interrupts
+    bool pooling;                   // Delineate if the backend execution mode is going to be pooling or by interrupts
 };
 
 /*!
