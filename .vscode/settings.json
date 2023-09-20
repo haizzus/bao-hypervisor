@@ -1,6 +1,7 @@
 {
     "files.associations": {
         "emul.h": "c",
-        "interrupts.h": "c"
+        "interrupts.h": "c",
+        "spinlock.h": "c"
     }
 }

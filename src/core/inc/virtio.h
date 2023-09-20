@@ -30,7 +30,7 @@
 struct virtio_device {
     uint64_t va;                    // Virtual address that will be used to access the MMIO registers of the device
     size_t size;                    // Size of the MMIO region (usually 0x200)
-    uint64_t shmem_id;              // Shared memory ID to be used
+    //uint64_t shmem_id;              // Shared memory ID to be used
     irqid_t interrupt;              // Used to notify the Backend when an access to a VirtIO MMIO register is performed (has significance when the parameter `polling` is not true)
     uint32_t device_id;             // Device ID
     int frontend_id;                // Contains the ID of the VM where the frontend driver is located (Generated automatically by virtio_init function)
@@ -40,19 +40,31 @@ struct virtio_device {
 };
 
 /*!
- * @struct  virtio_device_params
- * @brief   Contains the parameters of a VirtIO device access        
+ * @struct  virtio_access
+ * @brief   Contains the specific parameters of a VirtIO device access
+ * @example The frontend_cpu_id field is used to identify the frontend that is accessing the MMIO register because one virtio device can be shared by multiple frontends
  */
-struct virtio_device_params{
+struct virtio_access {
     node_t node;                    // Node of the list
-    uint64_t id;                    // Device ID
     unsigned long reg_off;          // Gives the offset of the MMIO Register that was accessed
     unsigned long access_width;     // Access width (VirtIO MMIO only allows 4-byte wide and alligned accesses)
     unsigned long op;               // Write or Read operation
     unsigned long value;            // Value to write or read
     unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
-    unsigned int backend_cpu_id;    // Backend CPU ID (used to signal the backend)
+    unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
     unsigned long reg;              // CPU register used to store the MMIO register value
+};
+
+/*!
+ * @struct  virtio_devices
+ * @brief   Contains the generic device parameters of a VirtIO device access 
+ * @example The device_id field is used to identify the device that is being accessed and the backend_cpu_id field is used to signal the backend        
+ */
+struct virtio_devices {
+    node_t node;                            // Node of the list
+    uint64_t device_id;                     // Device ID
+    unsigned int backend_cpu_id;            // Backend CPU ID (used to signal the backend)
+    struct list virtio_access_list;         // List of virtio_access
 };
 
 /*!
@@ -63,18 +75,6 @@ struct virtio_pooling_params{
     node_t node;
     uint64_t device_id;
 };
-
-/*!
- * @struct  virtio_device_list
- * @brief   Contains list of all VirtIO devices       
- */
-extern struct list virtio_device_list;
-
-/*!
- * @struct  virtio_device_pooling_list
- * @brief   Contains the list of pooling VirtIO devices       
- */
-extern struct list virtio_device_pooling_list;
 
 /*!
  * @fn              virtio_init

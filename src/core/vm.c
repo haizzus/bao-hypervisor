@@ -233,40 +233,6 @@ static struct vm* vm_allocation_init(struct vm_allocation* vm_alloc) {
     return vm;
 }
 
-/*
-static void virtio_ipc_init(struct vm* vm, const struct vm_config* vm_config)
-{
-    for (size_t j = 0; j < vm_config->platform.virtiodevices_num; j++) {
-        struct virtio_device *dev = &vm_config->platform.virtiodevices[j];
-        uint8_t shmem_id = config.virtio_device_list[dev->device_id].shmem_id;
-        struct shmem *shmem = ipc_get_shmem(shmem_id);
-        if(shmem == NULL) {
-            WARNING("Invalid shmem id in configuration. Ignored.");
-            continue;
-        }
-        size_t size = config.virtio_device_list[dev->device_id].shmem_size;
-        if(size > shmem->size) {
-            size = shmem->size;
-            WARNING("Trying to map region to smaller shared memory. Truncated");
-        }
-        
-        spin_lock(&shmem->lock);
-        shmem->cpu_masters |= (1ULL << cpu()->id);
-        spin_unlock(&shmem->lock);
-
-        struct vm_mem_region reg = {
-            .base = config.virtio_device_list[dev->device_id].shmem_base,
-            .size = size,
-            .place_phys = true,
-            .phys = shmem->phys,
-            .colors = shmem->colors
-        };
-
-        vm_map_mem_region(vm, &reg);
-    }
-}
-*/
-
 static void vm_init_virtio(struct vm* vm, const struct vm_config* vm_config)
 {
     // only initialize if there is at least a virtio device
