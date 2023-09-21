@@ -60,7 +60,8 @@ struct list virtio_device_pooling_list;
 struct list virtio_devices_list;
 
 OBJPOOL_ALLOC(virtio_device_pooling_pool, struct virtio_pooling_params, sizeof(struct virtio_pooling_params));
-OBJPOOL_ALLOC(virtio_access_pool, struct virtio_access, sizeof(struct virtio_access));
+OBJPOOL_ALLOC(virtio_frontend_access_pool, struct virtio_access, sizeof(struct virtio_access));
+OBJPOOL_ALLOC(virtio_backend_access_pool, struct virtio_access, sizeof(struct virtio_access));
 OBJPOOL_ALLOC(virtio_devices_pool, struct virtio_devices, sizeof(struct virtio_devices));
 
 static void virtio_handler(uint32_t, uint64_t);
@@ -86,7 +87,8 @@ void virtio_init()
     int backend_devices[virtiodevicelist_size];
 
     objpool_init(&virtio_devices_pool);
-    objpool_init(&virtio_access_pool);
+    objpool_init(&virtio_frontend_access_pool);
+    objpool_init(&virtio_backend_access_pool);
     list_init(&virtio_devices_list);
 
     objpool_init(&virtio_device_pooling_pool);
@@ -166,13 +168,31 @@ static bool virtio_hypercall_w_r_operation(unsigned long dev_id, unsigned long r
     {
         if(virtio_device->device_id == dev_id)
         {
-            // get the first element of the list (first request)
-            struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->virtio_access_list);
+            // get the first element of the backend list (first request)
+            struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->backend_access_list);
+            
             // if the register is wrong returns false
             if(node->reg_off != reg_off)
                 return false;
 
+            // Update the value
             node->value = value;
+
+            // Update the frontend request list
+            struct virtio_access *frontend_node = objpool_alloc(&virtio_frontend_access_pool);
+            frontend_node->access_width = node->access_width;
+            frontend_node->frontend_cpu_id = node->frontend_cpu_id;
+            frontend_node->frontend_vm_id = node->frontend_vm_id;
+            frontend_node->op = node->op;
+            frontend_node->reg = node->reg;
+            frontend_node->reg_off = node->reg_off;
+            frontend_node->value = node->value;
+            list_push(&virtio_device->frontend_access_list, (node_t*)frontend_node);
+
+            // free the backend node
+            objpool_free(&virtio_backend_access_pool, node);
+
+            // return
             return true;
         }
     }
@@ -194,7 +214,7 @@ static void virtio_cpu_msg_handler(uint32_t event, uint64_t data)
         if(virtio_device->device_id == data)
         {
             // pop the first element of the list (first request)
-            struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->virtio_access_list);
+            struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->frontend_access_list);
 
             switch(event)
             {
@@ -207,7 +227,7 @@ static void virtio_cpu_msg_handler(uint32_t event, uint64_t data)
                 break;
             }
             // free the node
-            objpool_free(&virtio_access_pool, node);
+            objpool_free(&virtio_frontend_access_pool, node);
             break;
         }
     }
@@ -236,7 +256,7 @@ static void virtio_cpu_send_msg(unsigned long dev_id, unsigned long op)
         if(virtio_device->device_id == dev_id)
         {
             // get the first element of the list (first request)
-            struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->virtio_access_list);
+            struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->frontend_access_list);
             cpu_send_msg(node->frontend_cpu_id, &msg);
             break;
         }
@@ -309,12 +329,12 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
                     if(virtio_device->device_id == dev_id)
                     {
                         // get the first element of the list (first request)
-                        struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->virtio_access_list);
+                        struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->backend_access_list);
                         if(node == NULL) 
                         {
                             ret = -HC_E_FAILURE;
                             break;
-                        }
+                        }                     
                         // write the values into the registers
                         vcpu_writereg(cpu()->vcpu, 1, dev_id);
                         vcpu_writereg(cpu()->vcpu, 2, node->reg_off);
@@ -401,7 +421,7 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
     {
         if(virtio_device->device_id == virtio_dev.device_id) 
         {
-            struct virtio_access *node = objpool_alloc(&virtio_access_pool);  
+            struct virtio_access *node = objpool_alloc(&virtio_backend_access_pool);  
             struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_NOTIFY_BACKEND_INT, virtio_dev.device_id};         
             node->frontend_cpu_id = cpu()->id;
             node->reg_off = acc->addr - virtio_dev.va;
@@ -430,15 +450,18 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
                         msg.event = VIRTIO_NOTIFY_BACKEND_POOL;
                     }
 
-                    // update the request list
-                    list_push(&virtio_device->virtio_access_list, (node_t*)node);
+                    // update the backend request list
+                    list_push(&virtio_device->backend_access_list, (node_t*)node);
 
+                    // send the message to the backend
                     cpu_send_msg(virtio_device->backend_cpu_id, &msg);
 
-                    // FIXME:
+                    // increment the program counter
                     cpu()->vcpu->regs.elr_el2 += 4;
-                    // Frontend CPU shold be pu in the idle state while the device is being emulated
+
+                    // Frontend CPU shold be put in the idle state while the device is being emulated
                     cpu_idle();
+
                     return true;
                 }
             break;   
@@ -449,7 +472,7 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
 
 /*!
  * @fn              virtio_handler
- * @brief           Handles the cpu_msg comming from the frontend
+ * @brief           Handles the cpu_msg comming from the frontend or backend
  * @note            This function is called by the cpu_msg handler and executed in the backend or frontend CPU
  * @param event     Contains the function to be called
  * @param data      Contains the device id

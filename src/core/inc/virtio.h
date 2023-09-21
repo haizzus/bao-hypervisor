@@ -64,7 +64,8 @@ struct virtio_devices {
     node_t node;                            // Node of the list
     uint64_t device_id;                     // Device ID
     unsigned int backend_cpu_id;            // Backend CPU ID (used to signal the backend)
-    struct list virtio_access_list;         // List of virtio_access
+    struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
+    struct list backend_access_list;        // List of backend virtio_access (backend request list)
 };
 
 /*!
