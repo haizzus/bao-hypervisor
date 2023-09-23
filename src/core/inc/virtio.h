@@ -31,12 +31,14 @@ struct virtio_device {
     uint64_t va;                    // Virtual address that will be used to access the MMIO registers of the device
     size_t size;                    // Size of the MMIO region (usually 0x200)
     //uint64_t shmem_id;              // Shared memory ID to be used
-    irqid_t interrupt;              // Used to notify the Backend when an access to a VirtIO MMIO register is performed (has significance when the parameter `polling` is not true)
+    irqid_t interrupt;              // Used to notify the Backend when an access to a VirtIO MMIO register is performed and to notify the Frontend (Used Buffer Notification or Configuration Change Notification)
     uint32_t device_id;             // Device ID
-    int frontend_id;                // Contains the ID of the VM where the frontend driver is located (Generated automatically by virtio_init function)
-    int backend_id;                 // Contains the ID of the VM where the backend driver is located (Generated automatically by virtio_init function)
+    int backend_vm_id;              // Contains the ID of the VM where the backend driver is located (Generated automatically by virtio_init function)
+    int frontend_vm_id;             // Contains the ID of the VM where the frontend driver is located (Generated automatically by virtio_init function)
+    int frontend_id;                // Contains the ID of the frontend driver (Generated automatically by virtio_init function)
     bool is_back_end;               // Specifies if the VM will contain the VirtIO backend driver
     bool pooling;                   // Delineate if the backend execution mode is going to be pooling or by interrupts
+    int priority;                   // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
 };
 
 /*!
@@ -52,6 +54,8 @@ struct virtio_access {
     unsigned long value;            // Value to write or read
     unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
     unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
+    unsigned int frontend_id;       // Frontend ID of the driver that is accessing the MMIO register
+    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
     unsigned long reg;              // CPU register used to store the MMIO register value
 };
 
@@ -66,15 +70,6 @@ struct virtio_devices {
     unsigned int backend_cpu_id;            // Backend CPU ID (used to signal the backend)
     struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
     struct list backend_access_list;        // List of backend virtio_access (backend request list)
-};
-
-/*!
- * @struct  virtio_pooling_params
- * @brief   Contains the parameters of a VirtIO device access in polling mode        
- */
-struct virtio_pooling_params{
-    node_t node;
-    uint64_t device_id;
 };
 
 /*!
