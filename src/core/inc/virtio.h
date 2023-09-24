@@ -4,9 +4,7 @@
  * Copyright (c) Bao Project (www.bao-project.org), 2019-
  *
  * Authors:
- *      João Peixoto <pg50479@alunos.uminho.pt>
- *      Nuno Capela <a84981@alunos.uminho.pt>
- *      João Rodrigo <a85218@alunos.uminho.pt>
+ *      João Peixoto <joaopeixotooficial@gmail.com>
  *
  * Bao is free software; you can redistribute it and/or modify it under the
  * terms of the GNU General Public License version 2 as published by the Free
@@ -42,37 +40,6 @@ struct virtio_device {
 };
 
 /*!
- * @struct  virtio_access
- * @brief   Contains the specific parameters of a VirtIO device access
- * @example The frontend_cpu_id field is used to identify the frontend that is accessing the MMIO register because one virtio device can be shared by multiple frontends
- */
-struct virtio_access {
-    node_t node;                    // Node of the list
-    unsigned long reg_off;          // Gives the offset of the MMIO Register that was accessed
-    unsigned long access_width;     // Access width (VirtIO MMIO only allows 4-byte wide and alligned accesses)
-    unsigned long op;               // Write or Read operation
-    unsigned long value;            // Value to write or read
-    unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
-    unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
-    unsigned int frontend_id;       // Frontend ID of the driver that is accessing the MMIO register
-    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
-    unsigned long reg;              // CPU register used to store the MMIO register value
-};
-
-/*!
- * @struct  virtio_devices
- * @brief   Contains the generic device parameters of a VirtIO device access 
- * @example The device_id field is used to identify the device that is being accessed and the backend_cpu_id field is used to signal the backend        
- */
-struct virtio_devices {
-    node_t node;                            // Node of the list
-    uint64_t device_id;                     // Device ID
-    unsigned int backend_cpu_id;            // Backend CPU ID (used to signal the backend)
-    struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
-    struct list backend_access_list;        // List of backend virtio_access (backend request list)
-};
-
-/*!
  * @fn              virtio_init
  * @brief           Responsible to initialize the VirtIO devices
  * @return          void     
@@ -81,7 +48,7 @@ void virtio_init();
 
 /*!
  * @fn              virtio_assign_backend_cpu
- * @brief           Responsible to update the VirtIO backend CPU ID (backend_cpu_id)
+ * @brief           Responsible to update the VirtIO backend CPU ID (backend_cpu_id) for each VirtIO device
  * @return          void     
  */
 void virtio_assign_backend_cpu(struct vm* vm);
@@ -93,7 +60,7 @@ void virtio_assign_backend_cpu(struct vm* vm);
  * @param   arg0    First argument of the hypercall
  * @param   arg1    Second argument of the hypercall
  * @param   arg2    Third argument of the hypercall
- * @return          void     
+ * @return          unsigned long     
  */
 unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned long arg2);
 
@@ -102,7 +69,7 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
  * @brief                   Handle every MMIO register access of a VirtIO device
  * @note                    Executed by the frontend CPU
  * @param   emul_access     Structure that contains the information of the MMIO register access
- * @return                  void     
+ * @return                  bool     
  */
 bool virtio_mmio_emul_handler(struct emul_access *);
 

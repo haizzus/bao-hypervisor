@@ -4,9 +4,7 @@
  * Copyright (c) Bao Project (www.bao-project.org), 2019-
  *
  * Authors:
- *      João Peixoto <pg50479@alunos.uminho.pt>
- *      Nuno Capela <a84981@alunos.uminho.pt>
- *      João Rodrigo <a85218@alunos.uminho.pt>
+ *      João Peixoto <joaopeixotooficial@gmail.com>
  *
  * Bao is free software; you can redistribute it and/or modify it under the
  * terms of the GNU General Public License version 2 as published by the Free
@@ -23,27 +21,60 @@
 #include <objpool.h>
 #include <config.h>
 
+#define VIRTIO_DEVICES_NUM 50
+
 /*!
  * @enum
- * @brief   VirtIO hypercall operations      
+ * @brief   VirtIO hypercall events
+ * @note    Used by the backend VM      
  */
-enum {
-    VIRTIO_WRITE_OP,       // Write operation
-    VIRTIO_READ_OP,        // Read operation 
-    VIRTIO_ASK_OP,         // Ask operation                  
-    VIRTIO_INTERRUPT_OP    // Interrupt operation (used event notification -> backend buffer used on the virtqueue)
+enum VIRTIO_HYP_EVENTS {
+    VIRTIO_WRITE_OP,        // Write operation
+    VIRTIO_READ_OP,         // Read operation 
+    VIRTIO_ASK_OP,          // Ask operation (used to get the next request)                  
+    VIRTIO_NOTIFY_OP        // Notification operation (used buffer notification or configuration change notification)
 };
 
 /*!
  * @enum
  * @brief   VirtIO cpu_msg events      
  */
-enum {
+enum VIRTIO_CPU_MSG_EVENTS {
     VIRTIO_WRITE_NOTIFY,        // Write notification
     VIRTIO_READ_NOTIFY,         // Read notification
-    VIRTIO_NOTIFY_BACKEND_INT,  // Notify backend by interrupt
+    VIRTIO_INJECT_INTERRUPT,    // Inject interrupt into the frontend VM or backend VM
     VIRTIO_NOTIFY_BACKEND_POOL, // Notify backend by pooling
-    VIRTIO_INJECT_INTERRUPT     // Inject interrupt into the backend
+};
+
+/*!
+ * @struct  virtio_access
+ * @brief   Contains the specific parameters of a VirtIO device access
+ * @example The frontend_cpu_id field is used to identify the frontend that is accessing the MMIO register because one virtio device can be shared by multiple frontends
+ */
+struct virtio_access {
+    node_t node;                    // Node of the list
+    unsigned long reg_off;          // Gives the offset of the MMIO Register that was accessed
+    unsigned long access_width;     // Access width (VirtIO MMIO only allows 4-byte wide and alligned accesses)
+    unsigned long op;               // Write or Read operation
+    unsigned long value;            // Value to write or read
+    unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
+    unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
+    unsigned int frontend_id;       // Frontend ID of the driver that is accessing the MMIO register
+    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
+    unsigned long reg;              // CPU register used to store the MMIO register value
+};
+
+/*!
+ * @struct  virtio_devices
+ * @brief   Contains the generic device parameters of a VirtIO device access 
+ * @example The device_id field is used to identify the device that is being accessed and the backend_cpu_id field is used to signal the backend        
+ */
+struct virtio_devices {
+    node_t node;                            // Node of the list
+    uint64_t device_id;                     // Device ID
+    unsigned int backend_cpu_id;            // Backend CPU ID (used to signal the backend)
+    struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
+    struct list backend_access_list;        // List of backend virtio_access (backend request list)
 };
 
 /*!
@@ -120,8 +151,14 @@ void virtio_assign_backend_cpu(struct vm* vm)
 {
     list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
     {
-        if (vm->virtiodevices[virtio_device->device_id].backend_vm_id == cpu()->vcpu->vm->id)
-            virtio_device->backend_cpu_id = cpu()->id;
+        for (int i = 0; i < vm->virtiodevices_num; i++)
+        {
+            if (vm->virtiodevices[i].device_id == virtio_device->device_id && vm->virtiodevices[i].backend_vm_id == cpu()->vcpu->vm->id)
+            {
+                virtio_device->backend_cpu_id = cpu()->id;
+                return;
+            }  
+        }
     }
 }
 
@@ -156,6 +193,7 @@ static bool virtio_hypercall_w_r_operation(unsigned long dev_id, unsigned long r
             frontend_node->access_width = node->access_width;
             frontend_node->frontend_cpu_id = node->frontend_cpu_id;
             frontend_node->frontend_vm_id = node->frontend_vm_id;
+            frontend_node->priority = node->priority;
             frontend_node->op = node->op;
             frontend_node->reg = node->reg;
             frontend_node->reg_off = node->reg_off;
@@ -208,8 +246,8 @@ static void virtio_cpu_msg_handler(uint32_t event, uint64_t data)
 
 /*!
  * @fn              virtio_cpu_send_msg
- * @brief           Sends a message from the backend to the frontend guest (wake up)
- * @note            Executed by the backend VM
+ * @brief           Sends a message from the backend CPU to the frontend CPU (wake up)
+ * @note            Executed by the backend CPU
  * @param dev_id    Contains the device id
  * @param op        Contains the operation type
  * @return          void
@@ -219,49 +257,69 @@ static void virtio_cpu_send_msg(unsigned long dev_id, unsigned long op)
     uint64_t data = dev_id;
     struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_WRITE_NOTIFY, data};
 
-    if(op == VIRTIO_READ_OP)
+    if (op == VIRTIO_READ_OP)
         msg.event = VIRTIO_READ_NOTIFY;
-    else if(op == VIRTIO_INTERRUPT_OP) 
+    else if (op == VIRTIO_NOTIFY_OP) 
         msg.event = VIRTIO_INJECT_INTERRUPT;
 
-    list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+    // if the operation is a read or write operation, then the backend must send the message to the frontend guest according to the most prioritary request
+    if (op == VIRTIO_READ_OP || op == VIRTIO_WRITE_OP)
     {
-        if(virtio_device->device_id == dev_id)
+        list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
         {
-            // get the first element of the list (most prioritary request)
-            struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->frontend_access_list);
+            if(virtio_device->device_id == dev_id)
+            {
+                // get the first element of the list (most prioritary request)
+                struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->frontend_access_list);
 
-            if (node == NULL)
-                ERROR("Failed to get the first element of the list");
-            
-            // send the message to the frontend guest
-            cpu_send_msg(node->frontend_cpu_id, &msg);
-            break;
+                if (node == NULL)
+                    ERROR("Failed to get the first element of the list");
+
+                // send the message to the frontend guest
+                cpu_send_msg(node->frontend_cpu_id, &msg);
+                break;
+            }
         }
+    }
+    // if the operation is an interrupt operation, then the backend only needs to send a notification to wake up the frontend guest (identified by the frontend id)
+    // In this case, the dev_id field is used to identify the frontend driver (frontend id)
+    else if (op == VIRTIO_NOTIFY_OP)
+    {
+        // send the message to the frontend guest
+        //cpu_send_msg(node->frontend_cpu_id, &msg);
     }
 }
 
 /*!
  * @fn              virtio_inject_interrupt
- * @brief           Injects an interrupt into the vcpu where the backend or frontend VM are running
- * @note            Executed by the backend or frontend VM
+ * @brief           Injects an interrupt into the vcpu where the frontend VM or backend are running
+ * @note            Executed by frontend CPU (Used buffer notification or change configuration notification) or backend CPU (backend interrupt mode)
  * @param data      Contains the device id
  * @return          void
  */
 static void virtio_inject_interrupt(uint64_t data)
 {
+    irqid_t irq_id = 0;
     volatile int i;
     for(i = 0; i < cpu()->vcpu->vm->virtiodevices_num; i++)
+    {
         if(cpu()->vcpu->vm->virtiodevices[i].device_id == data)
         {
-            vcpu_inject_irq(cpu()->vcpu, cpu()->vcpu->vm->virtiodevices[i].interrupt);
+            // get the interrupt id
+            irq_id = cpu()->vcpu->vm->virtiodevices[data].interrupt;
             break;
         }
+    }
+    // inject the interrupt into the vcpu where the frontend VM or backend VM are running, if valid
+    if(irq_id)
+        vcpu_inject_irq(cpu()->vcpu, cpu()->vcpu->vm->virtiodevices[i].interrupt);
+    else
+        ERROR("Failed to inject interrupt");
 }
 
 unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned long arg2)
 {    
-    unsigned long ret = -HC_E_SUCCESS;
+    unsigned long ret = -HC_E_SUCCESS;                      // return value
     unsigned long dev_id = cpu()->vcpu->regs.x[2];          // device id
     unsigned long reg_off = cpu()->vcpu->regs.x[3];         // MMIO register offset
     unsigned long op = cpu()->vcpu->regs.x[4];              // operation 
@@ -277,7 +335,7 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
             else
                 virtio_cpu_send_msg(dev_id, op);
         break;
-        // ask operation
+        // ask operation (used to get the next request)
         case VIRTIO_ASK_OP:
             if(reg_off != 0 || value != 0)
             {
@@ -307,8 +365,8 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
             }
             ret = -HC_E_FAILURE;
         break;
-        // used event notification
-        case VIRTIO_INTERRUPT_OP:
+        // used buffer notification or configuration change notification
+        case VIRTIO_NOTIFY_OP:
             if(reg_off != 0 || value != 0)
                 ret = -HC_E_FAILURE;
             else
@@ -317,32 +375,8 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
         default:
             ret = -HC_E_INVAL_ARGS;
         break;
-    } 
-    
+    }
     return ret;
-}
-
-/*!
- * @fn              virtio_notify_backend_handler
- * @brief           Notifies the backend VM by injecting an interrupt into the vcpu where the backend VM is running
- * @note            Executed in the backend CPU and only used when the backend execution mode is interrupt
- * @param data      Contains the device id
- * @return          void     
- */
-static void virtio_notify_backend_handler(uint64_t data)
-{
-    irqid_t irq_id = 0;
-    volatile int i;
-    for(i = 0; i < cpu()->vcpu->vm->virtiodevices_num; i++)
-        if(cpu()->vcpu->vm->virtiodevices[i].device_id == data)
-        {
-            // get the interrupt id
-            irq_id = cpu()->vcpu->vm->virtiodevices[data].interrupt;
-            break;
-        }
-    // inject the interrupt into the vcpu where the backend VM is running
-    if(irq_id)  
-        vcpu_inject_irq(cpu()->vcpu, irq_id);
 }
 
 bool virtio_mmio_emul_handler(struct emul_access *acc)
@@ -367,7 +401,7 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
         if(virtio_device->device_id == virtio_dev.device_id) 
         {
             struct virtio_access *node = objpool_alloc(&virtio_backend_access_pool);  
-            struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_NOTIFY_BACKEND_INT, virtio_dev.device_id};         
+            struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_INJECT_INTERRUPT, virtio_dev.device_id};         
             node->frontend_cpu_id = cpu()->id;
             node->reg_off = acc->addr - virtio_dev.va;
             node->reg = acc->reg;
@@ -429,9 +463,10 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
  */
 static void virtio_handler(uint32_t event, uint64_t data)
 {
-    switch(event){
-        case VIRTIO_NOTIFY_BACKEND_INT: 
-            virtio_notify_backend_handler(data);
+    switch(event)
+    {
+        case VIRTIO_INJECT_INTERRUPT:
+            virtio_inject_interrupt(data);
         break;
         case VIRTIO_NOTIFY_BACKEND_POOL:
             // Do nothing (the backend will make requests on a periodic form, through hypercalls)
@@ -439,9 +474,6 @@ static void virtio_handler(uint32_t event, uint64_t data)
         case VIRTIO_READ_NOTIFY:
         case VIRTIO_WRITE_NOTIFY: 
             virtio_cpu_msg_handler(event, data);
-        break;
-        case VIRTIO_INJECT_INTERRUPT:
-            virtio_inject_interrupt(data);
         break;
     }
 }
