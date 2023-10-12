@@ -47,6 +47,7 @@ void vm_vcpu_init(struct vm* vm, const struct vm_config* config)
     vcpu->id = vcpu_id;
     vcpu->phys_id = cpu()->id;
     vcpu->vm = vm;
+    vcpu->active = true;
     cpu()->vcpu = vcpu;
 
     vcpu_arch_init(vcpu, vm);
@@ -259,7 +260,7 @@ static void vm_init_virtio(struct vm* vm, const struct vm_config* vm_config)
                 vm_emul_add_mem(vm, emu);
             }
         }
-        virtio_assign_backend_cpu(vm);
+        virtio_assign_cpus(vm);
     }
 }
 
@@ -391,6 +392,10 @@ __attribute__((weak)) cpumap_t vm_translate_to_vcpu_mask(struct vm* vm,
 
 void vcpu_run(struct vcpu* vcpu)
 {
-    cpu()->vcpu->active = true;
-    vcpu_arch_run(vcpu);
+    if (vcpu->active == false) {
+        cpu_idle();
+    }
+    else {
+        vcpu_arch_run(vcpu);
+    }
 }

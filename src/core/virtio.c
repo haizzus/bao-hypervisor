@@ -21,7 +21,8 @@
 #include <objpool.h>
 #include <config.h>
 
-#define VIRTIO_DEVICES_NUM 50
+#define VIRTIO_INSTANCES_NUM 50
+#define VIRTIO_UNINITIALIZED -1
 
 /*!
  * @enum
@@ -47,9 +48,25 @@ enum VIRTIO_CPU_MSG_EVENTS {
 };
 
 /*!
+ * @struct  virtio_instance
+ * @brief   Contains information about a virtio device & driver pair (virtio instance)
+ */
+struct virtio_instance {
+    unsigned int backend_cpu_id;    // CPU ID of the guest that is accessing the MMIO register
+    unsigned int backend_vm_id;     // VM ID of the guest that is accessing the MMIO register
+    unsigned int backend_id;        // Frontend ID of the driver that is accessing the MMIO register
+    unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
+    unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
+    unsigned int frontend_id;       // Frontend ID of the driver that is accessing the MMIO register
+    unsigned int interrupt;         // Interrupt ID
+    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
+    unsigned int device_type;       // Device type (Used to identify the real physical device) 
+    bool pooling;                   // Delineate if the backend execution mode is going to be pooling or by interrupts
+};
+
+/*!
  * @struct  virtio_access
  * @brief   Contains the specific parameters of a VirtIO device access
- * @example The frontend_cpu_id field is used to identify the frontend that is accessing the MMIO register because one virtio device can be shared by multiple frontends
  */
 struct virtio_access {
     node_t node;                    // Node of the list
@@ -57,35 +74,32 @@ struct virtio_access {
     unsigned long access_width;     // Access width (VirtIO MMIO only allows 4-byte wide and alligned accesses)
     unsigned long op;               // Write or Read operation
     unsigned long value;            // Value to write or read
-    unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
-    unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
     unsigned int frontend_id;       // Frontend ID of the driver that is accessing the MMIO register
-    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
     unsigned long reg;              // CPU register used to store the MMIO register value
+    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
 };
 
 /*!
- * @struct  virtio_devices
- * @brief   Contains the generic device parameters of a VirtIO device access 
- * @example The device_id field is used to identify the device that is being accessed and the backend_cpu_id field is used to signal the backend        
+ * @struct  virtio
+ * @brief   Contains the necessary information of a VirtIO driver/device (instance)
  */
-struct virtio_devices {
+struct virtio {
     node_t node;                            // Node of the list
-    uint64_t device_id;                     // Device ID
-    unsigned int backend_cpu_id;            // Backend CPU ID (used to signal the backend)
+    uint64_t virtio_id;                     // VirtIO ID (used to connect each frontend driver to the backend device)
     struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
     struct list backend_access_list;        // List of backend virtio_access (backend request list)
+    struct virtio_instance instance;        // Virtio instance (driver + device) information
 };
 
 /*!
- * @struct  virtio_devices_list
- * @brief   Contains list of all VirtIO devices       
+ * @struct  virtio_list
+ * @brief   Contains list of all VirtIO instances (Driver + Device)      
  */
-struct list virtio_devices_list;
+struct list virtio_list;
 
 OBJPOOL_ALLOC(virtio_frontend_access_pool, struct virtio_access, sizeof(struct virtio_access));
 OBJPOOL_ALLOC(virtio_backend_access_pool, struct virtio_access, sizeof(struct virtio_access));
-OBJPOOL_ALLOC(virtio_devices_pool, struct virtio_devices, sizeof(struct virtio_devices));
+OBJPOOL_ALLOC(virtio_pool, struct virtio, sizeof(struct virtio));
 
 // functions prototypes
 static void virtio_handler(uint32_t, uint64_t);
@@ -96,20 +110,21 @@ CPU_MSG_HANDLER(virtio_handler, VIRTIO_CPUMSG_ID);
 
 void virtio_init()
 {
-    int driver_id = 0;
+    int frontend_id = 0;
+    int backend_id = 0;
     volatile int i, vm_id;
-    int backend_devices[VIRTIO_DEVICES_NUM];
+    int backend_devices[VIRTIO_INSTANCES_NUM];
 
-    objpool_init(&virtio_devices_pool);
+    objpool_init(&virtio_pool);
     objpool_init(&virtio_frontend_access_pool);
     objpool_init(&virtio_backend_access_pool);
-    list_init(&virtio_devices_list);
+    list_init(&virtio_list);
 
-    // initialize the array to verify if there is only one backend for each virtio device
-    for (i = 0; i < VIRTIO_DEVICES_NUM; i++)
-        backend_devices[i] = -1;
+    // initialize the array to verify if there is only one backend for each virtio instance
+    for (i = 0; i < VIRTIO_INSTANCES_NUM; i++)
+        backend_devices[i] = VIRTIO_UNINITIALIZED;
 
-    // create the list of all virtio devices available and assign the backend and frontend ids
+    // create the list of all virtio instances available and assign the backend and frontend ids
     for (vm_id = 0; vm_id < config.vmlist_size; vm_id++)
     {
         struct vm_config *vm_config = &config.vmlist[vm_id]; 
@@ -118,46 +133,89 @@ void virtio_init()
             struct virtio_device *dev = &vm_config->platform.virtiodevices[i];
             if (dev->is_back_end)
             {
-                struct virtio_devices *node = objpool_alloc(&virtio_devices_pool);
-                node->device_id = dev->device_id;
-                list_push(&virtio_devices_list, (node_t*)node);
+                struct virtio *node = objpool_alloc(&virtio_pool);
+                node->virtio_id = dev->virtio_id;
+                list_push(&virtio_list, (node_t*)node);
 
-                // more than one backend for the same virtio device
-                if (backend_devices[dev->device_id] != -1) 
+                // more than one backend for the same virtio instance
+                if (backend_devices[dev->virtio_id] != VIRTIO_UNINITIALIZED) 
                 {
-                    list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+                    list_foreach(virtio_list, struct virtio, virtio_device)
                     {
-                        objpool_free(&virtio_devices_pool, (struct virtio_devices*)list_pop(&virtio_devices_list));
+                        objpool_free(&virtio_pool, (struct virtio*)list_pop(&virtio_list));
                     }
-                    ERROR("Failed to link backend to the device, more than one back-end was atributed to the VirtIO device %d", dev->device_id);
+                    ERROR("Failed to link backend to the device, more than one back-end was atributed to the VirtIO instance %d", dev->virtio_id);
                 }
-                // first backend for the virtio device
+                // first backend for the virtio instance
                 else 
                 {
                     dev->backend_vm_id = vm_id;
-                    backend_devices[dev->device_id] = vm_id;
+                    dev->backend_id = backend_id++;
+                    backend_devices[dev->virtio_id] = vm_id;
                 }
             }
             else 
             {
                 dev->frontend_vm_id = vm_id;
-                dev->frontend_id = driver_id++;
+                dev->frontend_id = frontend_id++;
+            }
+        }
+    }
+
+    // checks if there is a 1-to-1 mapping between a virtio backend and virtio frontend
+    if (backend_id != frontend_id)
+        ERROR("There is no 1-to-1 mapping between a virtio backend and virtio frontend");
+
+    // initialize the virtio instances
+    for (vm_id = 0; vm_id < config.vmlist_size; vm_id++)
+    {
+        struct vm_config *vm_config = &config.vmlist[vm_id]; 
+        for (i = 0; i < vm_config->platform.virtiodevices_num; i++) 
+        {
+            struct virtio_device *dev = &vm_config->platform.virtiodevices[i];
+            list_foreach(virtio_list, struct virtio, virtio_device)
+            {
+                if (dev->virtio_id == virtio_device->virtio_id)
+                {
+                    if (dev->is_back_end)
+                    {
+                        virtio_device->instance.backend_vm_id = dev->backend_vm_id;
+                        virtio_device->instance.backend_id = dev->backend_id;
+                        virtio_device->instance.interrupt = dev->interrupt;
+                        virtio_device->instance.device_type = dev->device_type;
+                        virtio_device->instance.pooling = dev->pooling;
+                    }
+                    else
+                    {
+                        virtio_device->instance.frontend_vm_id = dev->frontend_vm_id;
+                        virtio_device->instance.frontend_id = dev->frontend_id;
+                        virtio_device->instance.priority = dev->priority;
+                    }
+                }
             }
         }
     }
 }
 
-void virtio_assign_backend_cpu(struct vm* vm)
+void virtio_assign_cpus(struct vm* vm)
 {
-    list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+    for (int i = 0; i < vm->virtiodevices_num; i++)
     {
-        for (int i = 0; i < vm->virtiodevices_num; i++)
+        list_foreach(virtio_list, struct virtio, virtio_device)
         {
-            if (vm->virtiodevices[i].device_id == virtio_device->device_id && vm->virtiodevices[i].backend_vm_id == cpu()->vcpu->vm->id)
+            if (vm->virtiodevices[i].virtio_id == virtio_device->virtio_id)
             {
-                virtio_device->backend_cpu_id = cpu()->id;
-                return;
-            }  
+                if (vm->virtiodevices[i].backend_vm_id == cpu()->vcpu->vm->id)
+                {
+                    virtio_device->instance.backend_cpu_id = cpu()->id;
+                    return;
+                }
+                else if (vm->virtiodevices[i].frontend_vm_id == cpu()->vcpu->vm->id)
+                {
+                    virtio_device->instance.frontend_cpu_id = cpu()->id;
+                    return;
+                }
+            }
         }
     }
 }
@@ -166,17 +224,16 @@ void virtio_assign_backend_cpu(struct vm* vm)
  * @fn                  virtio_hypercall_w_r_operation
  * @brief               Performs a write or read operation in a VirtIO device
  * @note                Executed by the backend VM
- * @param dev_id        Contains the device id
+ * @param virtio_id     Contains the virtio id
  * @param reg_off       Contains the MMIO register offset
  * @param value         Contains the register value
- * @param frontend_id   Contains the frontend driver id
  * @return              true if the operation was successful, false otherwise     
  */
-static bool virtio_hypercall_w_r_operation(unsigned long dev_id, unsigned long reg_off, unsigned long value)
+static bool virtio_hypercall_w_r_operation(unsigned long virtio_id, unsigned long reg_off, unsigned long value)
 {
-    list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+    list_foreach(virtio_list, struct virtio, virtio_device)
     {
-        if(virtio_device->device_id == dev_id)
+        if(virtio_device->virtio_id == virtio_id)
         {
             // pop the first element of the backend list (most prioritary request)
             struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->backend_access_list);
@@ -191,8 +248,6 @@ static bool virtio_hypercall_w_r_operation(unsigned long dev_id, unsigned long r
             // Update the frontend request list
             struct virtio_access *frontend_node = objpool_alloc(&virtio_frontend_access_pool);
             frontend_node->access_width = node->access_width;
-            frontend_node->frontend_cpu_id = node->frontend_cpu_id;
-            frontend_node->frontend_vm_id = node->frontend_vm_id;
             frontend_node->priority = node->priority;
             frontend_node->op = node->op;
             frontend_node->reg = node->reg;
@@ -215,14 +270,14 @@ static bool virtio_hypercall_w_r_operation(unsigned long dev_id, unsigned long r
  * @brief           Handles the cpu_msg comming from the backend
  * @note            Executed by the frontend VM, is responsible to write the value into the MMIO register (for the read operation)
  * @param event     Contains the function to be called
- * @param data      Contains the device id
+ * @param data      Contains the virtio id
  * @return          void   
  */
 static void virtio_cpu_msg_handler(uint32_t event, uint64_t data)
 {
-    list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+    list_foreach(virtio_list, struct virtio, virtio_device)
     {
-        if(virtio_device->device_id == data)
+        if(virtio_device->virtio_id == data)
         {
             // pop the first element of the list (most prioritary request)
             struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->frontend_access_list);
@@ -239,80 +294,75 @@ static void virtio_cpu_msg_handler(uint32_t event, uint64_t data)
             }
             // free the node
             objpool_free(&virtio_frontend_access_pool, node);
+            cpu()->vcpu->active = true;
             break;
         }
     }
 }
 
 /*!
- * @fn              virtio_cpu_send_msg
- * @brief           Sends a message from the backend CPU to the frontend CPU (wake up)
- * @note            Executed by the backend CPU
- * @param dev_id    Contains the device id
- * @param op        Contains the operation type
- * @return          void
+ * @fn                  virtio_cpu_send_msg
+ * @brief               Sends a message from the backend CPU to the frontend CPU (wake up)
+ * @note                Executed by the backend CPU
+ * @param virtio_id     Contains the virtio id
+ * @param op            Contains the operation type
+ * @return              void
  */
-static void virtio_cpu_send_msg(unsigned long dev_id, unsigned long op)
+static void virtio_cpu_send_msg(unsigned long virtio_id, unsigned long op)
 {
-    uint64_t data = dev_id;
-    struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_WRITE_NOTIFY, data};
+    struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_WRITE_NOTIFY, (uint64_t)virtio_id};
 
     if (op == VIRTIO_READ_OP)
         msg.event = VIRTIO_READ_NOTIFY;
     else if (op == VIRTIO_NOTIFY_OP) 
         msg.event = VIRTIO_INJECT_INTERRUPT;
-
-    // if the operation is a read or write operation, then the backend must send the message to the frontend guest according to the most prioritary request
-    if (op == VIRTIO_READ_OP || op == VIRTIO_WRITE_OP)
+    
+    list_foreach(virtio_list, struct virtio, virtio_device)
     {
-        list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+        if(virtio_device->virtio_id == virtio_id)
         {
-            if(virtio_device->device_id == dev_id)
+            // if the operation is a read or write operation, then the backend must send the message to the frontend guest according to the most prioritary request
+            if (op == VIRTIO_READ_OP || op == VIRTIO_WRITE_OP)
             {
                 // get the first element of the list (most prioritary request)
                 struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->frontend_access_list);
 
                 if (node == NULL)
                     ERROR("Failed to get the first element of the list");
-
-                // send the message to the frontend guest
-                cpu_send_msg(node->frontend_cpu_id, &msg);
-                break;
             }
+
+            // if the operation is an `VIRTIO_NOTIFY_OP`, then the backend only needs to send a notification to wake up the frontend guest
+            
+            // send the message to the frontend guest
+            cpu_send_msg(virtio_device->instance.frontend_cpu_id, &msg);
         }
-    }
-    // if the operation is an interrupt operation, then the backend only needs to send a notification to wake up the frontend guest (identified by the frontend id)
-    // In this case, the dev_id field is used to identify the frontend driver (frontend id)
-    else if (op == VIRTIO_NOTIFY_OP)
-    {
-        // send the message to the frontend guest
-        //cpu_send_msg(node->frontend_cpu_id, &msg);
     }
 }
 
 /*!
  * @fn              virtio_inject_interrupt
- * @brief           Injects an interrupt into the vcpu where the frontend VM or backend are running
+ * @brief           Injects an interrupt into the vcpu where the frontend VM or backend VM are running
  * @note            Executed by frontend CPU (Used buffer notification or change configuration notification) or backend CPU (backend interrupt mode)
- * @param data      Contains the device id
+ * @param data      Contains the virtio id
  * @return          void
  */
 static void virtio_inject_interrupt(uint64_t data)
 {
     irqid_t irq_id = 0;
-    volatile int i;
-    for(i = 0; i < cpu()->vcpu->vm->virtiodevices_num; i++)
+
+    list_foreach(virtio_list, struct virtio, virtio_device)
     {
-        if(cpu()->vcpu->vm->virtiodevices[i].device_id == data)
+        if(virtio_device->virtio_id == data)
         {
             // get the interrupt id
-            irq_id = cpu()->vcpu->vm->virtiodevices[data].interrupt;
+            irq_id = virtio_device->instance.interrupt;
             break;
         }
     }
+
     // inject the interrupt into the vcpu where the frontend VM or backend VM are running, if valid
     if(irq_id)
-        vcpu_inject_irq(cpu()->vcpu, cpu()->vcpu->vm->virtiodevices[i].interrupt);
+        vcpu_inject_irq(cpu()->vcpu, irq_id);
     else
         ERROR("Failed to inject interrupt");
 }
@@ -320,7 +370,7 @@ static void virtio_inject_interrupt(uint64_t data)
 unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned long arg2)
 {    
     unsigned long ret = -HC_E_SUCCESS;                      // return value
-    unsigned long dev_id = cpu()->vcpu->regs.x[2];          // device id
+    unsigned long virtio_id = cpu()->vcpu->regs.x[2];       // virtio id
     unsigned long reg_off = cpu()->vcpu->regs.x[3];         // MMIO register offset
     unsigned long op = cpu()->vcpu->regs.x[4];              // operation 
     unsigned long value = cpu()->vcpu->regs.x[5];           // register value
@@ -330,10 +380,10 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
         // write or read operation
         case VIRTIO_WRITE_OP:
         case VIRTIO_READ_OP:
-            if(!virtio_hypercall_w_r_operation(dev_id, reg_off, value))
+            if(!virtio_hypercall_w_r_operation(virtio_id, reg_off, value))
                 ret = -HC_E_FAILURE;
             else
-                virtio_cpu_send_msg(dev_id, op);
+                virtio_cpu_send_msg(virtio_id, op);
         break;
         // ask operation (used to get the next request)
         case VIRTIO_ASK_OP:
@@ -342,9 +392,9 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
                 ret = -HC_E_FAILURE;
                 break;
             }
-            list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+            list_foreach(virtio_list, struct virtio, virtio_device)
             {
-                if(virtio_device->device_id == dev_id)
+                if(virtio_device->virtio_id == virtio_id)
                 {
                     // get the first element of the list (most prioritary request)
                     struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->backend_access_list);
@@ -354,12 +404,11 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
                         break;
                     }                     
                     // write the values into the registers
-                    vcpu_writereg(cpu()->vcpu, 1, dev_id);
+                    vcpu_writereg(cpu()->vcpu, 1, virtio_id);
                     vcpu_writereg(cpu()->vcpu, 2, node->reg_off);
                     vcpu_writereg(cpu()->vcpu, 3, node->op);
                     vcpu_writereg(cpu()->vcpu, 4, node->value);
                     vcpu_writereg(cpu()->vcpu, 5, node->access_width);
-                    vcpu_writereg(cpu()->vcpu, 6, node->frontend_id);
                     return ret;
                 }
             }
@@ -370,7 +419,7 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
             if(reg_off != 0 || value != 0)
                 ret = -HC_E_FAILURE;
             else
-                virtio_cpu_send_msg(dev_id, op);
+                virtio_cpu_send_msg(virtio_id, op);
         break;
         default:
             ret = -HC_E_INVAL_ARGS;
@@ -396,19 +445,17 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
     if (i == vm->virtiodevices_num)
        return false;
 
-    list_foreach(virtio_devices_list, struct virtio_devices, virtio_device)
+    list_foreach(virtio_list, struct virtio, virtio_device)
     {
-        if(virtio_device->device_id == virtio_dev.device_id) 
+        if(virtio_device->virtio_id == virtio_dev.virtio_id) 
         {
             struct virtio_access *node = objpool_alloc(&virtio_backend_access_pool);  
-            struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_INJECT_INTERRUPT, virtio_dev.device_id};         
-            node->frontend_cpu_id = cpu()->id;
+            struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_INJECT_INTERRUPT, virtio_dev.virtio_id};         
             node->reg_off = acc->addr - virtio_dev.va;
             node->reg = acc->reg;
             node->access_width = acc->width;
-            node->frontend_vm_id = vm->virtiodevices[virtio_dev.device_id].frontend_vm_id;
-            node->frontend_id = vm->virtiodevices[virtio_dev.device_id].frontend_id;
-            node->priority = vm->virtiodevices[virtio_dev.device_id].priority;
+            node->priority = virtio_device->instance.priority;
+            node->frontend_id = virtio_device->instance.frontend_id;
 
             // if the frontend driver is writing into the register, then the backend driver must read the value to effectively write it
             if(acc->write)
@@ -425,7 +472,7 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
             }
             for(j = 0; j < config.vmlist[virtio_dev.backend_vm_id].platform.virtiodevices_num; j++)
             {
-                if(config.vmlist[virtio_dev.backend_vm_id].platform.virtiodevices[j].device_id == virtio_dev.device_id)
+                if(config.vmlist[virtio_dev.backend_vm_id].platform.virtiodevices[j].virtio_id == virtio_dev.virtio_id)
                 {
                     if(config.vmlist[virtio_dev.backend_vm_id].platform.virtiodevices[j].pooling)
                     {
@@ -436,12 +483,13 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
                     list_insert_ordered(&virtio_device->backend_access_list, (node_t*)node, virtio_prio_node_cmp);
 
                     // send the message to the backend
-                    cpu_send_msg(virtio_device->backend_cpu_id, &msg);
+                    cpu_send_msg(virtio_device->instance.backend_cpu_id, &msg);
 
                     // increment the program counter
                     cpu()->vcpu->regs.elr_el2 += 4;
 
-                    // Frontend CPU shold be put in the idle state while the device is being emulated
+                    // Frontend CPU should be put in the idle state while the device is being emulated
+                    cpu()->vcpu->active = false;
                     cpu_idle();
 
                     return true;
