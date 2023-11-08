@@ -33,7 +33,7 @@ enum VIRTIO_HYP_EVENTS {
     VIRTIO_WRITE_OP,        // Write operation
     VIRTIO_READ_OP,         // Read operation 
     VIRTIO_ASK_OP,          // Ask operation (used to get the next request)                  
-    VIRTIO_NOTIFY_OP        // Notification operation (used buffer notification or configuration change notification)
+    VIRTIO_NOTIFY_OP,       // Notification operation (used buffer notification or configuration change notification)
 };
 
 /*!
@@ -71,6 +71,7 @@ struct virtio_instance {
 struct virtio_access {
     node_t node;                    // Node of the list
     unsigned long reg_off;          // Gives the offset of the MMIO Register that was accessed
+    unsigned long addr;             // Gives the address of the MMIO Register that was accessed
     unsigned long access_width;     // Access width (VirtIO MMIO only allows 4-byte wide and alligned accesses)
     unsigned long op;               // Write or Read operation
     unsigned long value;            // Value to write or read
@@ -88,6 +89,7 @@ struct virtio {
     uint64_t virtio_id;                     // VirtIO ID (used to connect each frontend driver to the backend device)
     struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
     struct list backend_access_list;        // List of backend virtio_access (backend request list)
+    struct list backend_access_ask_list;    // List of backend virtio_access (backend ask list)
     struct virtio_instance instance;        // Virtio instance (driver + device) information
 };
 
@@ -99,6 +101,7 @@ struct list virtio_list;
 
 OBJPOOL_ALLOC(virtio_frontend_access_pool, struct virtio_access, sizeof(struct virtio_access));
 OBJPOOL_ALLOC(virtio_backend_access_pool, struct virtio_access, sizeof(struct virtio_access));
+OBJPOOL_ALLOC(virtio_backend_access_ask_pool, struct virtio_access, sizeof(struct virtio_access));
 OBJPOOL_ALLOC(virtio_pool, struct virtio, sizeof(struct virtio));
 
 // functions prototypes
@@ -118,6 +121,7 @@ void virtio_init()
     objpool_init(&virtio_pool);
     objpool_init(&virtio_frontend_access_pool);
     objpool_init(&virtio_backend_access_pool);
+    objpool_init(&virtio_backend_access_ask_pool);
     list_init(&virtio_list);
 
     // initialize the array to verify if there is only one backend for each virtio instance
@@ -252,6 +256,7 @@ static bool virtio_hypercall_w_r_operation(unsigned long virtio_id, unsigned lon
             frontend_node->op = node->op;
             frontend_node->reg = node->reg;
             frontend_node->reg_off = node->reg_off;
+            frontend_node->addr = node->addr;
             frontend_node->value = node->value;
             list_push(&virtio_device->frontend_access_list, (node_t*)frontend_node);
 
@@ -372,8 +377,9 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
     unsigned long ret = -HC_E_SUCCESS;                      // return value
     unsigned long virtio_id = cpu()->vcpu->regs.x[2];       // virtio id
     unsigned long reg_off = cpu()->vcpu->regs.x[3];         // MMIO register offset
-    unsigned long op = cpu()->vcpu->regs.x[4];              // operation 
-    unsigned long value = cpu()->vcpu->regs.x[5];           // register value
+    //unsigned long addr = cpu()->vcpu->regs.x[4];            // MMIO register address
+    unsigned long op = cpu()->vcpu->regs.x[5];              // operation 
+    unsigned long value = cpu()->vcpu->regs.x[6];           // register value
 
     switch(op)
     {
@@ -387,6 +393,7 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
         break;
         // ask operation (used to get the next request)
         case VIRTIO_ASK_OP:
+            INFO("VirtIO Ask Operation.");
             if(reg_off != 0 || value != 0)
             {
                 ret = -HC_E_FAILURE;
@@ -396,19 +403,24 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
             {
                 if(virtio_device->virtio_id == virtio_id)
                 {
-                    // get the first element of the list (most prioritary request)
-                    struct virtio_access* node = (struct virtio_access*)list_peek(&virtio_device->backend_access_list);
+                    // get the first element of the ask list (most prioritary request)
+                    struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->backend_access_ask_list);
                     if(node == NULL) 
                     {
                         ret = -HC_E_FAILURE;
                         break;
-                    }                     
+                    }
                     // write the values into the registers
                     vcpu_writereg(cpu()->vcpu, 1, virtio_id);
                     vcpu_writereg(cpu()->vcpu, 2, node->reg_off);
-                    vcpu_writereg(cpu()->vcpu, 3, node->op);
-                    vcpu_writereg(cpu()->vcpu, 4, node->value);
-                    vcpu_writereg(cpu()->vcpu, 5, node->access_width);
+                    vcpu_writereg(cpu()->vcpu, 3, node->addr);
+                    vcpu_writereg(cpu()->vcpu, 4, node->op);
+                    vcpu_writereg(cpu()->vcpu, 5, node->value);
+                    vcpu_writereg(cpu()->vcpu, 6, node->access_width);
+
+                    // free the node
+                    objpool_free(&virtio_backend_access_ask_pool, node);
+                    
                     return ret;
                 }
             }
@@ -452,6 +464,7 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
             struct virtio_access *node = objpool_alloc(&virtio_backend_access_pool);  
             struct cpu_msg msg = {VIRTIO_CPUMSG_ID, VIRTIO_INJECT_INTERRUPT, virtio_dev.virtio_id};         
             node->reg_off = acc->addr - virtio_dev.va;
+            node->addr = acc->addr;
             node->reg = acc->reg;
             node->access_width = acc->width;
             node->priority = virtio_device->instance.priority;
@@ -481,6 +494,11 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
 
                     // update the backend request list (ordered by priority)
                     list_insert_ordered(&virtio_device->backend_access_list, (node_t*)node, virtio_prio_node_cmp);
+
+                    // update the backend ask list (ordered by priority)
+                    struct virtio_access *node_ask = objpool_alloc(&virtio_backend_access_ask_pool);  
+                    *node_ask = *node;
+                    list_insert_ordered(&virtio_device->backend_access_ask_list, (node_t*)node_ask, virtio_prio_node_cmp);
 
                     // send the message to the backend
                     cpu_send_msg(virtio_device->instance.backend_cpu_id, &msg);
