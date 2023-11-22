@@ -48,20 +48,30 @@ enum VIRTIO_CPU_MSG_EVENTS {
 };
 
 /*!
+ * @enum
+ * @brief   VirtIO direction      
+ */
+enum VIRTIO_DIRECTION {
+    VIRTIO_FRONTEND_TO_BACKEND,
+    VIRTIO_BACKEND_TO_FRONTEND,
+};
+
+/*!
  * @struct  virtio_instance
  * @brief   Contains information about a virtio device & driver pair (virtio instance)
  */
 struct virtio_instance {
-    unsigned int backend_cpu_id;    // CPU ID of the guest that is accessing the MMIO register
-    unsigned int backend_vm_id;     // VM ID of the guest that is accessing the MMIO register
-    unsigned int backend_id;        // Frontend ID of the driver that is accessing the MMIO register
-    unsigned int frontend_cpu_id;   // CPU ID of the guest that is accessing the MMIO register
-    unsigned int frontend_vm_id;    // VM ID of the guest that is accessing the MMIO register
-    unsigned int frontend_id;       // Frontend ID of the driver that is accessing the MMIO register
-    unsigned int interrupt;         // Interrupt ID
-    unsigned int priority;          // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
-    unsigned int device_type;       // Device type (Used to identify the real physical device) 
-    bool pooling;                   // Delineate if the backend execution mode is going to be pooling or by interrupts
+    unsigned int backend_cpu_id;        // CPU ID of the VirtIO backend
+    unsigned int backend_vm_id;         // VM ID of the VirtIO backend
+    unsigned int backend_id;            // Backend ID of the VirtIO backend
+    unsigned int frontend_cpu_id;       // CPU ID of the guest that is accessing the MMIO register
+    unsigned int frontend_vm_id;        // VM ID of the guest that is accessing the MMIO register
+    unsigned int frontend_id;           // Frontend ID of the driver that is accessing the MMIO register
+    unsigned int virtio_interrupt;      // Interrupt used to notify the backend VM that a new VirtIO request is available
+    unsigned int device_interrupt;      // Interrupt used to notify the frontend guest (used buffer notification or configuration change notification)
+    unsigned int priority;              // Priority (higher number means lower priority) of the driver (Used to schedule the backend driver)
+    unsigned int device_type;           // Device type (Used to identify the real physical device) 
+    bool pooling;                       // Delineate if the backend execution mode is going to be pooling or by interrupts
 };
 
 /*!
@@ -87,6 +97,7 @@ struct virtio_access {
 struct virtio {
     node_t node;                            // Node of the list
     uint64_t virtio_id;                     // VirtIO ID (used to connect each frontend driver to the backend device)
+    enum VIRTIO_DIRECTION direction;        // Direction of the VirtIO flow
     struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
     struct list backend_access_list;        // List of backend virtio_access (backend request list)
     struct list backend_access_ask_list;    // List of backend virtio_access (backend ask list)
@@ -185,15 +196,16 @@ void virtio_init()
                     {
                         virtio_device->instance.backend_vm_id = dev->backend_vm_id;
                         virtio_device->instance.backend_id = dev->backend_id;
-                        virtio_device->instance.interrupt = dev->interrupt;
                         virtio_device->instance.device_type = dev->device_type;
-                        virtio_device->instance.pooling = dev->pooling;
+                        virtio_device->instance.virtio_interrupt = vm_config->platform.virtio_interrupt;
+                        virtio_device->instance.pooling = vm_config->platform.virtio_pooling;
                     }
                     else
                     {
                         virtio_device->instance.frontend_vm_id = dev->frontend_vm_id;
                         virtio_device->instance.frontend_id = dev->frontend_id;
                         virtio_device->instance.priority = dev->priority;
+                        virtio_device->instance.device_interrupt = dev->device_interrupt;
                     }
                 }
             }
@@ -246,10 +258,13 @@ static bool virtio_hypercall_w_r_operation(unsigned long virtio_id, unsigned lon
             if(node->reg_off != reg_off)
                 break;
 
-            // Update the value
+            // update the value
             node->value = value;
 
-            // Update the frontend request list
+            // update the direction
+            virtio_device->direction = VIRTIO_BACKEND_TO_FRONTEND;
+
+            // update the frontend request list
             struct virtio_access *frontend_node = objpool_alloc(&virtio_frontend_access_pool);
             frontend_node->access_width = node->access_width;
             frontend_node->priority = node->priority;
@@ -359,8 +374,12 @@ static void virtio_inject_interrupt(uint64_t data)
     {
         if(virtio_device->virtio_id == data)
         {
-            // get the interrupt id
-            irq_id = virtio_device->instance.interrupt;
+            // if the direction is from the frontend to the backend, then the interrupt is the virtio interrupt
+            // if the direction is from the backend to the frontend, then the interrupt is the device interrupt
+            if (virtio_device->direction == VIRTIO_FRONTEND_TO_BACKEND)
+                irq_id = virtio_device->instance.virtio_interrupt;
+            else
+                irq_id = virtio_device->instance.device_interrupt;
             break;
         }
     }
@@ -393,7 +412,6 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
         break;
         // ask operation (used to get the next request)
         case VIRTIO_ASK_OP:
-            INFO("VirtIO Ask Operation.");
             if(reg_off != 0 || value != 0)
             {
                 ret = -HC_E_FAILURE;
@@ -401,7 +419,10 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
             }
             list_foreach(virtio_list, struct virtio, virtio_device)
             {
-                if(virtio_device->virtio_id == virtio_id)
+                // if the virtio device is the same as the one that is being accessed and the backend cpu and vm are the same as the current cpu and vm
+                if(virtio_device->virtio_id == virtio_id && 
+                   cpu()->id == virtio_device->instance.backend_cpu_id && 
+                   cpu()->vcpu->vm->id == virtio_device->instance.backend_vm_id)
                 {
                     // get the first element of the ask list (most prioritary request)
                     struct virtio_access* node = (struct virtio_access*)list_pop(&virtio_device->backend_access_ask_list);
@@ -492,6 +513,9 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
                         msg.event = VIRTIO_NOTIFY_BACKEND_POOL;
                     }
 
+                    // update the direction
+                    virtio_device->direction = VIRTIO_FRONTEND_TO_BACKEND;
+
                     // update the backend request list (ordered by priority)
                     list_insert_ordered(&virtio_device->backend_access_list, (node_t*)node, virtio_prio_node_cmp);
 
@@ -506,7 +530,7 @@ bool virtio_mmio_emul_handler(struct emul_access *acc)
                     // increment the program counter
                     cpu()->vcpu->regs.elr_el2 += 4;
 
-                    // Frontend CPU should be put in the idle state while the device is being emulated
+                    // frontend CPU should be put in the idle state while the device is being emulated
                     cpu()->vcpu->active = false;
                     cpu_idle();
 
@@ -535,7 +559,7 @@ static void virtio_handler(uint32_t event, uint64_t data)
             virtio_inject_interrupt(data);
         break;
         case VIRTIO_NOTIFY_BACKEND_POOL:
-            // Do nothing (the backend will make requests on a periodic form, through hypercalls)
+            // Do nothing (the backend VM will make requests on a periodic form, through hypercalls)
         break;
         case VIRTIO_READ_NOTIFY:
         case VIRTIO_WRITE_NOTIFY: 

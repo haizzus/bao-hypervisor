@@ -50,6 +50,8 @@ struct vm_platform {
 
     /* VirtIO devices */
     size_t virtiodevices_num;
+    bool virtio_pooling;
+    size_t virtio_interrupt;
     struct virtio_device *virtiodevices;
 
     // /**
@@ -92,6 +94,8 @@ struct vm {
 
     /* VirtIO devices */
     size_t virtiodevices_num;
+    bool virtio_pooling;
+    size_t virtio_interrupt;
     struct virtio_device *virtiodevices; 
 };
 

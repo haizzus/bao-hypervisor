@@ -241,6 +241,8 @@ static void vm_init_virtio(struct vm* vm, const struct vm_config* vm_config)
     {
         // save the virtio devices in the vm
         vm->virtiodevices_num = vm_config->platform.virtiodevices_num;
+        vm->virtio_pooling = vm_config->platform.virtio_pooling;
+        vm->virtio_interrupt = vm_config->platform.virtio_interrupt;
         vm->virtiodevices = vm_config->platform.virtiodevices;
         
         // for all the virtio devices of the vm
