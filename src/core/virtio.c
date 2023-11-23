@@ -34,6 +34,8 @@ enum VIRTIO_HYP_EVENTS {
     VIRTIO_READ_OP,         // Read operation 
     VIRTIO_ASK_OP,          // Ask operation (used to get the next request)                  
     VIRTIO_NOTIFY_OP,       // Notification operation (used buffer notification or configuration change notification)
+    VIRTIO_VM_CREATE_OP,    // VM create operation
+    VIRTIO_VM_DESTROY_OP,   // VM destroy operation
 };
 
 /*!
@@ -54,6 +56,11 @@ enum VIRTIO_CPU_MSG_EVENTS {
 enum VIRTIO_DIRECTION {
     VIRTIO_FRONTEND_TO_BACKEND,
     VIRTIO_BACKEND_TO_FRONTEND,
+};
+
+enum VIRTIO_VM_STATE {
+    VIRTIO_VM_UNASSIGNED,
+    VIRTIO_VM_ASSIGNED,
 };
 
 /*!
@@ -97,6 +104,7 @@ struct virtio_access {
 struct virtio {
     node_t node;                            // Node of the list
     uint64_t virtio_id;                     // VirtIO ID (used to connect each frontend driver to the backend device)
+    enum VIRTIO_VM_STATE state;             // State of the VirtIO instance (assigned or unassigned)
     enum VIRTIO_DIRECTION direction;        // Direction of the VirtIO flow
     struct list frontend_access_list;       // List of frontend virtio_access (frontend request list) 
     struct list backend_access_list;        // List of backend virtio_access (backend request list)
@@ -150,6 +158,7 @@ void virtio_init()
             {
                 struct virtio *node = objpool_alloc(&virtio_pool);
                 node->virtio_id = dev->virtio_id;
+                node->state = VIRTIO_VM_UNASSIGNED;
                 list_push(&virtio_list, (node_t*)node);
 
                 // more than one backend for the same virtio instance
@@ -454,6 +463,25 @@ unsigned long virtio_hypercall(unsigned long arg0, unsigned long arg1, unsigned 
             else
                 virtio_cpu_send_msg(virtio_id, op);
         break;
+        // create or destroy operation
+        case VIRTIO_VM_CREATE_OP:
+        case VIRTIO_VM_DESTROY_OP:
+            list_foreach(virtio_list, struct virtio, virtio_device)
+            {
+                if(virtio_device->virtio_id == virtio_id && 
+                   cpu()->id == virtio_device->instance.backend_cpu_id && 
+                   cpu()->vcpu->vm->id == virtio_device->instance.backend_vm_id)
+                {
+                    if ((op == VIRTIO_VM_CREATE_OP && virtio_device->state == VIRTIO_VM_ASSIGNED) ||
+                        (op == VIRTIO_VM_DESTROY_OP && virtio_device->state == VIRTIO_VM_UNASSIGNED))
+                        ret = -HC_E_FAILURE;
+                    else
+                        virtio_device->state = (op == VIRTIO_VM_CREATE_OP) ? VIRTIO_VM_ASSIGNED : VIRTIO_VM_UNASSIGNED;
+                    return ret;
+                }
+            }
+            ret = -HC_E_FAILURE;
+            break;
         default:
             ret = -HC_E_INVAL_ARGS;
         break;
